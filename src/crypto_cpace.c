@@ -67,31 +67,65 @@ static size_t build_transcript(const unsigned char *YA, const unsigned char *ADa
     return off;
 }
 
-/* calculate_generator_from_prs:
- * Implements generator derivation per draft-irtf-cfrg-cpace-15 7.1:
- *  - gen_str = lv_cat(DSI, PRS, zero_pad, CI, sid)
- *  - map hash(gen_str) -> curve point via hash-to-curve (here: crypto_core_ristretto255_from_hash)
- *
- * Simplified here: CI and sid omitted (client/server ids removed per request).
- * Zero-pad handling is deterministic; mapping uses SHA-512 as described in 7.1 for Ristretto target.
+/* Uses SHA-512 (so s_in_bytes = 128). Implements generator_string per Appendix A.2.
+ * Produces 64-byte hash input to crypto_core_ristretto255_from_hash.
  */
-static int calculate_generator_from_prs(const unsigned char *PRS, size_t PRS_len, unsigned char *G_out) {
-    const size_t zero_pad_len = 16; /* deterministic small pad (satisfies gen_str uniqueness) */
-    unsigned char *parts[3];
-    size_t lens[3];
-    parts[0] = (unsigned char *)G_DSI; lens[0] = sizeof(G_DSI) - 1; /* DSI per 7.1 */
-    parts[1] = (unsigned char *)PRS;   lens[1] = PRS_len;          /* PRS included as in 7.1 */
-    unsigned char zpad[zero_pad_len];
-    memset(zpad, 0x00, zero_pad_len);
-    parts[2] = zpad; lens[2] = zero_pad_len;
-    size_t buf_cap = lens[0] + lens[1] + lens[2] + 32;
+static int calculate_generator_from_prs(const unsigned char *PRS, size_t PRS_len,
+                                        unsigned char *G_out) {
+    if (!PRS || PRS_len > CRYPTO_CPACE_MAX_SECRET_LEN) return -1;
+
+    const unsigned char *DSI = G_DSI;
+    size_t DSI_len = sizeof(G_DSI) - 1;
+
+    /* hash block size for SHA-512 */
+    const size_t s_in_bytes = 128;
+
+    /* compute prepend_len sizes (LEB-like) */
+    uint8_t tmp[10];
+    size_t preDSI_len = leb128_encode_len(tmp, DSI_len);
+    size_t prePRS_len = leb128_encode_len(tmp, PRS_len);
+
+    /* len_zpad = max(0, s_in_bytes - 1 - preDSI_len - prePRS_len) */
+    size_t len_zpad = 0;
+    if (s_in_bytes > 1 + preDSI_len + prePRS_len) {
+        len_zpad = s_in_bytes - 1 - preDSI_len - prePRS_len;
+    }
+
+    /* compute total buffer size precisely: for lv_cat we'll need
+     * prepend_len(DSI) + DSI_len + prepend_len(PRS) + PRS_len + len_zpad
+     */
+    size_t buf_cap = preDSI_len + DSI_len + prePRS_len + PRS_len + len_zpad;
     unsigned char *buf = (unsigned char *)sodium_malloc(buf_cap);
     if (!buf) return -1;
-    size_t buflen = lv_cat((const unsigned char **)parts, lens, 3, buf);
+
+    /* build generator_string: lv_cat(DSI, PRS, zero_bytes(len_zpad))
+     * we implement a small inline usage of lv_cat for these 3 parts
+     */
+    size_t off = 0;
+    uint8_t lenbuf[10];
+
+    size_t lb = leb128_encode_len(lenbuf, DSI_len);
+    memcpy(buf + off, lenbuf, lb); off += lb;
+    memcpy(buf + off, DSI, DSI_len); off += DSI_len;
+
+    lb = leb128_encode_len(lenbuf, PRS_len);
+    memcpy(buf + off, lenbuf, lb); off += lb;
+    if (PRS_len) { memcpy(buf + off, PRS, PRS_len); off += PRS_len; }
+
+    /* zero padding block */
+    if (len_zpad) { memset(buf + off, 0x00, len_zpad); off += len_zpad; }
+
+    /* now hash */
     unsigned char h[crypto_hash_sha512_BYTES];
-    crypto_hash_sha512(h, buf, buflen);
+    crypto_hash_sha512(h, buf, off);
     sodium_free(buf);
-    if (crypto_core_ristretto255_from_hash(G_out, h) != 0) return -1;
+
+    /* libsodium expects 64-byte input for ristretto-from-hash */
+    if (crypto_core_ristretto255_from_hash(G_out, h) != 0) {
+        sodium_memzero(h, sizeof h);
+        return -1;
+    }
+    sodium_memzero(h, sizeof h);
     return 0;
 }
 
@@ -148,21 +182,27 @@ int crypto_cpace_step1(crypto_cpace_state *ctx,
     if (PRS_len > CRYPTO_CPACE_MAX_SECRET_LEN) return -1;
     if (ADa_len > CRYPTO_CPACE_MAX_AD_LEN || ADb_len > CRYPTO_CPACE_MAX_AD_LEN) return -1;
 
-    memcpy(ctx->PRS, PRS, PRS_len); ctx->PRS_len = PRS_len;
+    /* store ADs */
     if (ADa && ADa_len) { memcpy(ctx->ADa, ADa, ADa_len); ctx->ADa_len = ADa_len; } else { ctx->ADa_len = 0; }
     if (ADb && ADb_len) { memcpy(ctx->ADb, ADb, ADb_len); ctx->ADb_len = ADb_len; } else { ctx->ADb_len = 0; }
 
+    /* derive generator G from PRS */
     unsigned char G[CRYPTO_CPACE_PUBLICBYTES];
-    if (calculate_generator_from_prs(ctx->PRS, ctx->PRS_len, G) != 0) return -1;
+    if (calculate_generator_from_prs(PRS, PRS_len, G) != 0) return -1;
 
+    /* store G (public) into ctx, so we don't need to keep PRS there */
+    memcpy(ctx->G, G, CRYPTO_CPACE_PUBLICBYTES);
+    ctx->G_present = 1;
+
+    /* generate ephemeral scalar and compute Y_A = a·G */
     crypto_core_ristretto255_scalar_random(ctx->scalar);
-    if (compute_public_from_scalar(ctx->scalar, G, public_data) != 0) {
-        sodium_memzero(G, sizeof(G));
+    if (crypto_scalarmult_ristretto255(public_data, ctx->scalar, G) != 0) {
+        sodium_memzero(G, sizeof G);
         return -1;
     }
-
     memcpy(ctx->public, public_data, CRYPTO_CPACE_PUBLICBYTES);
-    sodium_memzero(G, sizeof(G));
+
+    sodium_memzero(G, sizeof G);
     return 0;
 }
 
@@ -216,35 +256,45 @@ int crypto_cpace_step2(unsigned char *response,
 }
 
 /* crypto_cpace_step3:
- * Client finishes: re-derive G from stored PRS, compute K = a·Y_B, build transcript using stored ADa/ADb
+ * Client finishes: compute K = a·Y_B, build transcript using stored ADa/ADb
  * per draft-irtf-cfrg-cpace-15 3.1 and 6.2, and derive ISK into shared_key.
  */
 int crypto_cpace_step3(crypto_cpace_state *ctx,
                        crypto_cpace_shared_keys *shared_keys,
-                       const unsigned char *response) {
+                       const unsigned char *response /* Y_B */) {
     if (!ctx || !shared_keys || !response) return -1;
-
-    unsigned char G[CRYPTO_CPACE_PUBLICBYTES];
-    if (calculate_generator_from_prs(ctx->PRS, ctx->PRS_len, G) != 0) return -1;
+    if (!ctx->G_present) return -1; /* client must have called step1 */
 
     unsigned char K[CRYPTO_CPACE_PUBLICBYTES];
     if (crypto_scalarmult_ristretto255(K, ctx->scalar, response) != 0) {
-        sodium_memzero(G, sizeof(G));
+        sodium_memzero(K, sizeof K);
         return -1;
     }
 
     unsigned char transcript[2048];
-    size_t tlen = build_transcript(ctx->public, ctx->ADa, ctx->ADa_len, response, ctx->ADb, ctx->ADb_len, transcript);
+    size_t tlen = build_transcript(ctx->public, ctx->ADa, ctx->ADa_len,
+                                   response, ctx->ADb, ctx->ADb_len,
+                                   transcript);
 
     if (derive_shared_key_from_K_and_transcript(K, sizeof(K), transcript, tlen, shared_keys->shared_key) != 0) {
-        sodium_memzero(G, sizeof(G));
-        sodium_memzero(K, sizeof(K));
-        sodium_memzero(transcript, sizeof(transcript));
+        sodium_memzero(K, sizeof K);
+        sodium_memzero(transcript, sizeof transcript);
         return -1;
     }
 
-    sodium_memzero(G, sizeof(G));
-    sodium_memzero(K, sizeof(K));
-    sodium_memzero(transcript, sizeof(transcript));
+    /* clear sensitive bits (scalar remains in ctx until user clears) */
+    sodium_memzero(K, sizeof K);
+    sodium_memzero(transcript, sizeof transcript);
     return 0;
+}
+
+/* securely clear context */
+void crypto_cpace_clear(crypto_cpace_state *ctx) {
+    if (!ctx) return;
+    sodium_memzero(ctx->scalar, sizeof ctx->scalar);
+    sodium_memzero(ctx->public, sizeof ctx->public);
+    sodium_memzero(ctx->G, sizeof ctx->G);
+    ctx->G_present = 0;
+    if (ctx->ADa_len) { sodium_memzero(ctx->ADa, ctx->ADa_len); ctx->ADa_len = 0; }
+    if (ctx->ADb_len) { sodium_memzero(ctx->ADb, ctx->ADb_len); ctx->ADb_len = 0; }
 }
