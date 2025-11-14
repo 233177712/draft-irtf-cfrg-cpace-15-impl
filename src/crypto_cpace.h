@@ -35,15 +35,17 @@ extern "C" {
 #define CRYPTO_CPACE_MAX_SECRET_LEN 256
 #define CRYPTO_CPACE_MAX_AD_LEN     256
 
-/* State structure
- * - stores PRS and per-peer ADs (ADa = client's AD, ADb = peer's AD) as required by draft-irtf-cfrg-cpace-15 3.1.
- * - stores scalar and public for client-side continuation (Step3).
+/* State structure (revised)
+ * - store ephemeral scalar & public (Y_A)
+ * - store derived generator G (public) so client does NOT need to retain PRS
+ * - ADa/ADb kept as before
  */
 typedef struct {
     unsigned char scalar[CRYPTO_CPACE_SCALARBYTES]; /* a */
     unsigned char public[CRYPTO_CPACE_PUBLICBYTES]; /* Y_A */
-    unsigned char PRS[CRYPTO_CPACE_MAX_SECRET_LEN];
-    size_t PRS_len;
+    unsigned char G[CRYPTO_CPACE_PUBLICBYTES];      /* derived generator (public) */
+    int           G_present;                       /* 0/1 flag */
+    /* Optional: PRS removed to avoid keeping secret in memory. If application wants to keep PRS, add it explicitly. */
     unsigned char ADa[CRYPTO_CPACE_MAX_AD_LEN]; /* client's AD (per 3.1) */
     size_t ADa_len;
     unsigned char ADb[CRYPTO_CPACE_MAX_AD_LEN]; /* peer's AD (per 3.1) */
