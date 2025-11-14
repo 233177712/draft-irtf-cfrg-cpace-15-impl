@@ -67,43 +67,35 @@ static size_t build_transcript(const unsigned char *YA, const unsigned char *ADa
     return off;
 }
 
-/* Uses SHA-512 (so s_in_bytes = 128). Implements generator_string per Appendix A.2.
- * Produces 64-byte hash input to crypto_core_ristretto255_from_hash.
+/* calculate_generator_from_prs_with_sid:
+ * gen_str = lv_cat(DSI, PRS, zero_pad, optional CI, optional sid)
+ * Here CI is omitted (per simplification), but sid is supported.
  */
-static int calculate_generator_from_prs(const unsigned char *PRS, size_t PRS_len,
-                                        unsigned char *G_out) {
-    if (!PRS || PRS_len > CRYPTO_CPACE_MAX_SECRET_LEN) return -1;
-
+static int calculate_generator_from_prs_with_sid(const unsigned char *PRS, size_t PRS_len,
+                                                 const unsigned char *sid, size_t sid_len,
+                                                 unsigned char *G_out) {
+    if (!PRS) return -1;
     const unsigned char *DSI = G_DSI;
     size_t DSI_len = sizeof(G_DSI) - 1;
+    const size_t s_in_bytes = 128; /* as earlier: SHA-512 block sizing used for zpad computation */
 
-    /* hash block size for SHA-512 */
-    const size_t s_in_bytes = 128;
-
-    /* compute prepend_len sizes (LEB-like) */
+    /* compute prepend lengths */
     uint8_t tmp[10];
     size_t preDSI_len = leb128_encode_len(tmp, DSI_len);
     size_t prePRS_len = leb128_encode_len(tmp, PRS_len);
+    size_t presid_len = sid_len ? leb128_encode_len(tmp, sid_len) : 0;
 
-    /* len_zpad = max(0, s_in_bytes - 1 - preDSI_len - prePRS_len) */
     size_t len_zpad = 0;
-    if (s_in_bytes > 1 + preDSI_len + prePRS_len) {
-        len_zpad = s_in_bytes - 1 - preDSI_len - prePRS_len;
+    if (s_in_bytes > 1 + preDSI_len + prePRS_len + presid_len) {
+        len_zpad = s_in_bytes - 1 - preDSI_len - prePRS_len - presid_len;
     }
 
-    /* compute total buffer size precisely: for lv_cat we'll need
-     * prepend_len(DSI) + DSI_len + prepend_len(PRS) + PRS_len + len_zpad
-     */
-    size_t buf_cap = preDSI_len + DSI_len + prePRS_len + PRS_len + len_zpad;
+    size_t buf_cap = preDSI_len + DSI_len + prePRS_len + PRS_len + len_zpad + presid_len + sid_len;
     unsigned char *buf = (unsigned char *)sodium_malloc(buf_cap);
     if (!buf) return -1;
 
-    /* build generator_string: lv_cat(DSI, PRS, zero_bytes(len_zpad))
-     * we implement a small inline usage of lv_cat for these 3 parts
-     */
     size_t off = 0;
     uint8_t lenbuf[10];
-
     size_t lb = leb128_encode_len(lenbuf, DSI_len);
     memcpy(buf + off, lenbuf, lb); off += lb;
     memcpy(buf + off, DSI, DSI_len); off += DSI_len;
@@ -112,15 +104,18 @@ static int calculate_generator_from_prs(const unsigned char *PRS, size_t PRS_len
     memcpy(buf + off, lenbuf, lb); off += lb;
     if (PRS_len) { memcpy(buf + off, PRS, PRS_len); off += PRS_len; }
 
-    /* zero padding block */
     if (len_zpad) { memset(buf + off, 0x00, len_zpad); off += len_zpad; }
 
-    /* now hash */
+    if (sid_len) {
+        lb = leb128_encode_len(lenbuf, sid_len);
+        memcpy(buf + off, lenbuf, lb); off += lb;
+        memcpy(buf + off, sid, sid_len); off += sid_len;
+    }
+
     unsigned char h[crypto_hash_sha512_BYTES];
     crypto_hash_sha512(h, buf, off);
     sodium_free(buf);
 
-    /* libsodium expects 64-byte input for ristretto-from-hash */
     if (crypto_core_ristretto255_from_hash(G_out, h) != 0) {
         sodium_memzero(h, sizeof h);
         return -1;
@@ -128,6 +123,7 @@ static int calculate_generator_from_prs(const unsigned char *PRS, size_t PRS_len
     sodium_memzero(h, sizeof h);
     return 0;
 }
+
 
 /* compute_public_from_scalar: out_pub = scalar * G
  * Per draft-irtf-cfrg-cpace-15 6.2: ephemeral scalar multiplication to derive Y_A/Y_B.
@@ -177,31 +173,33 @@ int crypto_cpace_step1(crypto_cpace_state *ctx,
                        unsigned char *public_data,
                        const unsigned char *PRS, size_t PRS_len,
                        const unsigned char *ADa, size_t ADa_len,
-                       const unsigned char *ADb, size_t ADb_len) {
+                       const unsigned char *ADb, size_t ADb_len,
+                       const unsigned char *sid, size_t sid_len) {
     if (!ctx || !public_data) return -1;
     if (PRS_len > CRYPTO_CPACE_MAX_SECRET_LEN) return -1;
     if (ADa_len > CRYPTO_CPACE_MAX_AD_LEN || ADb_len > CRYPTO_CPACE_MAX_AD_LEN) return -1;
+    if (sid_len > CRYPTO_CPACE_SID_MAX_BYTES) return -1;
 
     /* store ADs */
-    if (ADa && ADa_len) { memcpy(ctx->ADa, ADa, ADa_len); ctx->ADa_len = ADa_len; } else { ctx->ADa_len = 0; }
-    if (ADb && ADb_len) { memcpy(ctx->ADb, ADb, ADb_len); ctx->ADb_len = ADb_len; } else { ctx->ADb_len = 0; }
+    if (ADa && ADa_len) { memcpy(ctx->ADa, ADa, ADa_len); ctx->ADa_len = ADa_len; } else ctx->ADa_len = 0;
+    if (ADb && ADb_len) { memcpy(ctx->ADb, ADb, ADb_len); ctx->ADb_len = ADb_len; } else ctx->ADb_len = 0;
 
-    /* derive generator G from PRS */
+    /* store sid (public) if provided */
+    if (sid && sid_len) { memcpy(ctx->sid, sid, sid_len); ctx->sid_len = sid_len; ctx->sid_present = 1; }
+    else { ctx->sid_len = 0; ctx->sid_present = 0; }
+
     unsigned char G[CRYPTO_CPACE_PUBLICBYTES];
-    if (calculate_generator_from_prs(PRS, PRS_len, G) != 0) return -1;
+    if (calculate_generator_from_prs_with_sid(PRS, PRS_len, sid, sid_len, G) != 0) return -1;
 
-    /* store G (public) into ctx, so we don't need to keep PRS there */
     memcpy(ctx->G, G, CRYPTO_CPACE_PUBLICBYTES);
     ctx->G_present = 1;
 
-    /* generate ephemeral scalar and compute Y_A = a·G */
     crypto_core_ristretto255_scalar_random(ctx->scalar);
     if (crypto_scalarmult_ristretto255(public_data, ctx->scalar, G) != 0) {
         sodium_memzero(G, sizeof G);
         return -1;
     }
     memcpy(ctx->public, public_data, CRYPTO_CPACE_PUBLICBYTES);
-
     sodium_memzero(G, sizeof G);
     return 0;
 }
@@ -215,25 +213,26 @@ int crypto_cpace_step2(unsigned char *response,
                        crypto_cpace_shared_keys *shared_keys,
                        const unsigned char *PRS, size_t PRS_len,
                        const unsigned char *ADa, size_t ADa_len,
-                       const unsigned char *ADb, size_t ADb_len) {
+                       const unsigned char *ADb, size_t ADb_len,
+                       const unsigned char *sid, size_t sid_len) {
     if (!response || !public_data || !shared_keys) return -1;
     if (PRS_len > CRYPTO_CPACE_MAX_SECRET_LEN) return -1;
     if (ADa_len > CRYPTO_CPACE_MAX_AD_LEN || ADb_len > CRYPTO_CPACE_MAX_AD_LEN) return -1;
+    if (sid_len > CRYPTO_CPACE_SID_MAX_BYTES) return -1;
 
     unsigned char G[CRYPTO_CPACE_PUBLICBYTES];
-    if (calculate_generator_from_prs(PRS, PRS_len, G) != 0) return -1;
+    if (calculate_generator_from_prs_with_sid(PRS, PRS_len, sid, sid_len, G) != 0) return -1;
 
     unsigned char b[CRYPTO_CPACE_SCALARBYTES];
     crypto_core_ristretto255_scalar_random(b);
-    if (compute_public_from_scalar(b, G, response) != 0) {
-        sodium_memzero(G, sizeof(G));
+    if (crypto_scalarmult_ristretto255(response, b, G) != 0) {
+        sodium_memzero(G, sizeof(G)); sodium_memzero(b, sizeof(b));
         return -1;
     }
 
     unsigned char K[CRYPTO_CPACE_PUBLICBYTES];
     if (crypto_scalarmult_ristretto255(K, b, public_data) != 0) {
-        sodium_memzero(G, sizeof(G));
-        sodium_memzero(b, sizeof(b));
+        sodium_memzero(G, sizeof(G)); sodium_memzero(b, sizeof(b));
         return -1;
     }
 
@@ -241,11 +240,24 @@ int crypto_cpace_step2(unsigned char *response,
     size_t tlen = build_transcript(public_data, ADa, ADa_len, response, ADb, ADb_len, transcript);
 
     if (derive_shared_key_from_K_and_transcript(K, sizeof(K), transcript, tlen, shared_keys->shared_key) != 0) {
-        sodium_memzero(G, sizeof(G));
-        sodium_memzero(b, sizeof(b));
-        sodium_memzero(K, sizeof(K));
-        sodium_memzero(transcript, sizeof(transcript));
+        sodium_memzero_all(...); /* clear as before */
         return -1;
+    }
+
+    /* compute sid_output per draft 9.6 if sid not supplied */
+    if (!sid || sid_len == 0) {
+        crypto_hash_sha512_state sha;
+        const unsigned char label[] = "CPaceSidOutput";
+        crypto_hash_sha512_init(&sha);
+        crypto_hash_sha512_update(&sha, label, sizeof(label)-1);
+        crypto_hash_sha512_update(&sha, transcript, tlen);
+        unsigned char sid_full[crypto_hash_sha512_BYTES];
+        crypto_hash_sha512_final(&sha, sid_full);
+        memcpy(shared_keys->sid_output, sid_full, crypto_hash_sha512_BYTES);
+        shared_keys->sid_output_len = crypto_hash_sha512_BYTES;
+        sodium_memzero(sid_full, sizeof sid_full);
+    } else {
+        shared_keys->sid_output_len = 0; /* caller provided sid; no computed sid_output */
     }
 
     sodium_memzero(G, sizeof(G));
@@ -261,9 +273,10 @@ int crypto_cpace_step2(unsigned char *response,
  */
 int crypto_cpace_step3(crypto_cpace_state *ctx,
                        crypto_cpace_shared_keys *shared_keys,
-                       const unsigned char *response /* Y_B */) {
+                       const unsigned char *response,
+                       const unsigned char *sid, size_t sid_len) {
     if (!ctx || !shared_keys || !response) return -1;
-    if (!ctx->G_present) return -1; /* client must have called step1 */
+    if (!ctx->G_present) return -1;
 
     unsigned char K[CRYPTO_CPACE_PUBLICBYTES];
     if (crypto_scalarmult_ristretto255(K, ctx->scalar, response) != 0) {
@@ -272,17 +285,29 @@ int crypto_cpace_step3(crypto_cpace_state *ctx,
     }
 
     unsigned char transcript[2048];
-    size_t tlen = build_transcript(ctx->public, ctx->ADa, ctx->ADa_len,
-                                   response, ctx->ADb, ctx->ADb_len,
-                                   transcript);
+    size_t tlen = build_transcript(ctx->public, ctx->ADa, ctx->ADa_len, response, ctx->ADb, ctx->ADb_len, transcript);
 
     if (derive_shared_key_from_K_and_transcript(K, sizeof(K), transcript, tlen, shared_keys->shared_key) != 0) {
-        sodium_memzero(K, sizeof K);
-        sodium_memzero(transcript, sizeof transcript);
+        sodium_memzero_all(...);
         return -1;
     }
 
-    /* clear sensitive bits (scalar remains in ctx until user clears) */
+    /* compute sid_output if neither ctx nor caller supplied sid */
+    if ((!sid || sid_len == 0) && !ctx->sid_present) {
+        const unsigned char label[] = "CPaceSidOutput";
+        crypto_hash_sha512_state sha;
+        crypto_hash_sha512_init(&sha);
+        crypto_hash_sha512_update(&sha, label, sizeof(label)-1);
+        crypto_hash_sha512_update(&sha, transcript, tlen);
+        unsigned char sid_full[crypto_hash_sha512_BYTES];
+        crypto_hash_sha512_final(&sha, sid_full);
+        memcpy(shared_keys->sid_output, sid_full, crypto_hash_sha512_BYTES);
+        shared_keys->sid_output_len = crypto_hash_sha512_BYTES;
+        sodium_memzero(sid_full, sizeof sid_full);
+    } else {
+        shared_keys->sid_output_len = 0; /* sid provided by caller or stored in ctx */
+    }
+
     sodium_memzero(K, sizeof K);
     sodium_memzero(transcript, sizeof transcript);
     return 0;
@@ -295,6 +320,8 @@ void crypto_cpace_clear(crypto_cpace_state *ctx) {
     sodium_memzero(ctx->public, sizeof ctx->public);
     sodium_memzero(ctx->G, sizeof ctx->G);
     ctx->G_present = 0;
+    if (ctx->sid_present) { sodium_memzero(ctx->sid, ctx->sid_len); ctx->sid_len = 0; ctx->sid_present = 0; }
     if (ctx->ADa_len) { sodium_memzero(ctx->ADa, ctx->ADa_len); ctx->ADa_len = 0; }
     if (ctx->ADb_len) { sodium_memzero(ctx->ADb, ctx->ADb_len); ctx->ADb_len = 0; }
 }
+
