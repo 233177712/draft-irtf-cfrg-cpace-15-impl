@@ -34,69 +34,58 @@ extern "C" {
 #define CRYPTO_CPACE_SHAREDKEYBYTES 32U
 #define CRYPTO_CPACE_MAX_SECRET_LEN 256
 #define CRYPTO_CPACE_MAX_AD_LEN     256
+/* added SID support per draft-irtf-cfrg-cpace-15 sections 3.1, 7.1 and 9.6 */
+#define CRYPTO_CPACE_SID_MAX_BYTES   (crypto_hash_sha512_BYTES) /* sid_output size when computed */
 
-/* State structure (revised)
- * - store ephemeral scalar & public (Y_A)
- * - store derived generator G (public) so client does NOT need to retain PRS
- * - ADa/ADb kept as before
- */
+/* revised state: store public G and optional cached sid (public info) */
 typedef struct {
     unsigned char scalar[CRYPTO_CPACE_SCALARBYTES]; /* a */
     unsigned char public[CRYPTO_CPACE_PUBLICBYTES]; /* Y_A */
     unsigned char G[CRYPTO_CPACE_PUBLICBYTES];      /* derived generator (public) */
-    int           G_present;                       /* 0/1 flag */
-    /* Optional: PRS removed to avoid keeping secret in memory. If application wants to keep PRS, add it explicitly. */
-    unsigned char ADa[CRYPTO_CPACE_MAX_AD_LEN]; /* client's AD (per 3.1) */
+    int           G_present;
+    /* optional cached sid provided at step1 (public, not secret) */
+    unsigned char sid[CRYPTO_CPACE_SID_MAX_BYTES];
+    size_t        sid_len;
+    int           sid_present;
+    unsigned char ADa[CRYPTO_CPACE_MAX_AD_LEN];
     size_t ADa_len;
-    unsigned char ADb[CRYPTO_CPACE_MAX_AD_LEN]; /* peer's AD (per 3.1) */
+    unsigned char ADb[CRYPTO_CPACE_MAX_AD_LEN];
     size_t ADb_len;
 } crypto_cpace_state;
 
-/* single shared key (not split) - derived as ISK per draft-irtf-cfrg-cpace-15 6.2 */
+/* shared key result now may include sid_output (optional) */
 typedef struct {
     unsigned char shared_key[CRYPTO_CPACE_SHAREDKEYBYTES];
+    unsigned char sid_output[CRYPTO_CPACE_SID_MAX_BYTES]; /* if computed by CPace */
+    size_t        sid_output_len; /* 0 if no sid_output produced (i.e. caller supplied sid) */
 } crypto_cpace_shared_keys;
 
-void crypto_cpace_clear(crypto_cpace_state *ctx);
-/* initialize libsodium */
 int crypto_cpace_init(void);
 
-/* Step1 (client)
- * - outputs public_data (Y_A), length CRYPTO_CPACE_PUBLICBYTES
- * - inputs PRS, ADa, ADb (ADa is client's AD, ADb is peer's AD if known)
- * - stores state in ctx for Step3
- *
- * Conforms to draft-irtf-cfrg-cpace-15 6.2 (client step) and uses generator derivation per 7.1.
- */
+/* API changes: add 'sid' param to Step1/Step2/Step3 */
 int crypto_cpace_step1(crypto_cpace_state *ctx,
                        unsigned char *public_data,
                        const unsigned char *PRS, size_t PRS_len,
                        const unsigned char *ADa, size_t ADa_len,
-                       const unsigned char *ADb, size_t ADb_len);
+                       const unsigned char *ADb, size_t ADb_len,
+                       const unsigned char *sid, size_t sid_len);
 
-/* Step2 (server)
- * - inputs public_data (Y_A)
- * - outputs response (Y_B) and shared_keys (single shared key)
- * - inputs PRS, ADa, ADb
- *
- * Conforms to draft-irtf-cfrg-cpace-15 6.2 (server step).
- */
 int crypto_cpace_step2(unsigned char *response,
                        const unsigned char *public_data,
                        crypto_cpace_shared_keys *shared_keys,
                        const unsigned char *PRS, size_t PRS_len,
                        const unsigned char *ADa, size_t ADa_len,
-                       const unsigned char *ADb, size_t ADb_len);
+                       const unsigned char *ADb, size_t ADb_len,
+                       const unsigned char *sid, size_t sid_len);
 
-/* Step3 (client)
- * - inputs ctx (from Step1) and response (Y_B)
- * - outputs shared_keys
- *
- * Conforms to draft-irtf-cfrg-cpace-15 6.2 (client finishing step).
- */
 int crypto_cpace_step3(crypto_cpace_state *ctx,
                        crypto_cpace_shared_keys *shared_keys,
-                       const unsigned char *response);
+                       const unsigned char *response,
+                       const unsigned char *sid, size_t sid_len);
+
+/* clear ctx securely */
+void crypto_cpace_clear(crypto_cpace_state *ctx);
+
 
 #ifdef __cplusplus
 }
