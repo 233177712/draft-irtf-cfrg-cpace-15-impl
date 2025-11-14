@@ -35,15 +35,16 @@ extern "C" {
 #define CRYPTO_CPACE_MAX_SECRET_LEN 256
 #define CRYPTO_CPACE_MAX_AD_LEN     256
 /* added SID support per draft-irtf-cfrg-cpace-15 sections 3.1, 7.1 and 9.6 */
-#define CRYPTO_CPACE_SID_MAX_BYTES   (crypto_hash_sha512_BYTES) /* sid_output size when computed */
+/* crypto_cpace.h — relevant excerpts reflecting forced sid input and caching */
+#define CRYPTO_CPACE_SID_MAX_BYTES   (crypto_hash_sha512_BYTES) /* max sid bytes accepted */
 
-/* revised state: store public G and optional cached sid (public info) */
+/* State structure: client-side caches G and sid (public) */
 typedef struct {
     unsigned char scalar[CRYPTO_CPACE_SCALARBYTES]; /* a */
     unsigned char public[CRYPTO_CPACE_PUBLICBYTES]; /* Y_A */
     unsigned char G[CRYPTO_CPACE_PUBLICBYTES];      /* derived generator (public) */
     int           G_present;
-    /* optional cached sid provided at step1 (public, not secret) */
+    /* cached sid provided at step1 (public, not secret) */
     unsigned char sid[CRYPTO_CPACE_SID_MAX_BYTES];
     size_t        sid_len;
     int           sid_present;
@@ -53,16 +54,16 @@ typedef struct {
     size_t ADb_len;
 } crypto_cpace_state;
 
-/* shared key result now may include sid_output (optional) */
+/* Shared key result — no sid_output, only single shared_key */
 typedef struct {
     unsigned char shared_key[CRYPTO_CPACE_SHAREDKEYBYTES];
-    unsigned char sid_output[CRYPTO_CPACE_SID_MAX_BYTES]; /* if computed by CPace */
-    size_t        sid_output_len; /* 0 if no sid_output produced (i.e. caller supplied sid) */
 } crypto_cpace_shared_keys;
 
-int crypto_cpace_init(void);
-
-/* API changes: add 'sid' param to Step1/Step2/Step3 */
+/* API:
+ * - client step1 must provide sid (cached in ctx)
+ * - server step2 must provide same sid
+ * - client step3 reads sid from ctx (no sid param)
+ */
 int crypto_cpace_step1(crypto_cpace_state *ctx,
                        unsigned char *public_data,
                        const unsigned char *PRS, size_t PRS_len,
@@ -78,14 +79,13 @@ int crypto_cpace_step2(unsigned char *response,
                        const unsigned char *ADb, size_t ADb_len,
                        const unsigned char *sid, size_t sid_len);
 
+/* note: step3 no longer takes sid; it uses ctx->sid */
 int crypto_cpace_step3(crypto_cpace_state *ctx,
                        crypto_cpace_shared_keys *shared_keys,
-                       const unsigned char *response,
-                       const unsigned char *sid, size_t sid_len);
+                       const unsigned char *response);
 
 /* clear ctx securely */
 void crypto_cpace_clear(crypto_cpace_state *ctx);
-
 
 #ifdef __cplusplus
 }
