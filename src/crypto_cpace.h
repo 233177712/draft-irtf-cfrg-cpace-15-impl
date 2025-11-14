@@ -57,6 +57,7 @@ typedef struct {
     unsigned char shared_key[CRYPTO_CPACE_SHAREDKEYBYTES];
 } crypto_cpace_shared_keys;
 
+void crypto_cpace_clear(crypto_cpace_state *ctx);
 /* initialize libsodium */
 int crypto_cpace_init(void);
 
